@@ -1,69 +1,126 @@
 #include "mbed.h"
-#include "Bluetooth.h"
-#include "EncoderClass.h"
-#include "MotorClass.h"
+#include "Motor.h"
 #include "PID.h"
+#include "LineSensor.h"
+#include "kikibuggy.h"
 
-DigitalOut motorEnable(PA_13, 0);
-Motor motorLeft(D15, PC_9, PC_5);
-Motor motorRight(D14, PC_8, PC_6);
-Bluetooth ble;
-Encoder encR(PC_10, PC_12, 200);
-Encoder encL(PC_11, PD_2, 200);
+float maxPWML = 0;
+float maxPWMR = 0;
 
-float clamp(float value, float range_high, float range_low){
-    if (value < range_low){
-        return range_low;
-    }
-    else{
-        if (value > range_high){
-        return range_high;
+// ===== BLUETOOTH =====
+Serial hm10(PA_11, PA_12);
+
+// ===== DEBUG =====
+Serial pc(USBTX, USBRX);
+
+// ===== ENABLE =====
+DigitalOut enable(PA_13);
+
+// ===== MOTORS =====
+Motor motL(PB_8, PC_11, PD_2, NC, 512, PC_5, PC_9);
+Motor motR(PB_9, PC_10, PC_12, NC, 512, PC_6, PC_8);
+
+// ===== SENSOR =====
+LineSensor sensors(PC_2, PC_3, A2, A3, A4, A5);
+
+// ===== PID =====
+//        kp    ki     kd      t     Ts   out_min out_max kaw
+PID pidL(1.6f, 0.5f, 0.01f, 0.05f, 0.02f, -0.5f, 0.6f, 0.6f);
+PID pidR(1.6f, 0.5f, 0.01f, 0.05f, 0.02f, -0.5f, 0.6f, 0.6f);
+PID steerPID(0.9f, 0.0f, 0.4f, 0.05f, 0.02f, -0.35f, 0.35f, 0.15f);     // kp 0.6, kd 0.2
+
+DigitalOut C1(D2);
+DigitalOut C2(D3);
+DigitalOut C3(D8);
+DigitalOut C4(D9);
+DigitalOut C5(PA_15);
+DigitalOut C6(PA_14);
+
+// ===== BUGGY =====
+Buggy buggy(motL, motR, pidL, pidR, steerPID, sensors, 0.3f);
+
+// ===== BT COMMAND =====
+volatile char bt_cmd = 0;
+bool canTurn = true;
+Timer turnTimer;
+
+// ===== INTERRUPT =====
+void rXIRQ() {
+    char c = hm10.getc();
+    bt_cmd = c;   // store latest command only
+}
+
+void sendpwm(void){
+    hm10.printf("PWML: %0.2f, PWMR: %0.2f\r\n", maxPWML, maxPWMR);
+}
+
+// ===== MAIN =====
+int main() {
+
+    C1 = 1; 
+    C2 = 1; 
+    C3 = 1; 
+    C4 = 1; 
+    C5 = 1; 
+    C6 = 1; 
+
+    hm10.baud(9600);
+    hm10.attach(&rXIRQ, Serial::RxIrq);
+
+    enable = 0;
+
+    printf("Starting buggy...\r\n");
+
+    motL.setSpeed(0.0f);
+    motR.setSpeed(0.0f);
+
+    sensors.calibrate();
+
+    enable = 1;
+    buggy.start();
+
+    turnTimer.start();
+
+    while (1) {
+
+        // ===== NORMAL CONTROL UPDATE =====
+        buggy.update();
+
+        if (buggy.rtnpwmL()>maxPWML){
+            maxPWML = buggy.rtnpwmL();
+            sendpwm();
         }
-        else {
-        return value;
+        if (buggy.rtnpwmR()>maxPWMR){
+            maxPWMR = buggy.rtnpwmR();
+            sendpwm();
+        }
+        
+
+        // ===== LINE LOST AUTO STOP =====
+        if (buggy.shouldStop()) {
+            buggy.stop();
+        }
+
+        // ===== DEBOUNCE TURN COMMAND =====
+        if (bt_cmd == 't' && canTurn) {
+
+            bt_cmd = 0;          // clear immediately
+            canTurn = false;     // lock
+
+            printf("Turning...\r\n");
+
+            buggy.stop();
+            wait_ms(150);
+
+            buggy.turnaround();
+
+            // cooldown so it cannot retrigger instantly
+            turnTimer.reset();
+        }
+
+        // ===== RE-ENABLE TURN AFTER COOLDOWN =====
+        if (!canTurn && turnTimer.read_ms() > 800) {
+            canTurn = true;
         }
     }
 }
-
-int main(){
-    // float RPS_Max = 4.0;
-    // straight line
-    PID LeftMotor(50);
-    PID RightMotor(50);
-    ble.begin();
-
-    float rpsL, rpsR;
-    float pwmL = 0.5;
-    float pwmR = 0.5;
-    
-    wait(3);
-    //setup time
-    motorEnable.write(1);
-    const float loop_time_s = 0.02f;
-    while (1) {
-        LeftMotor.setReference(5.5);
-        LeftMotor.setDT(loop_time_s);
-        LeftMotor.setGain(0.05, 0.3, 0);
-        rpsL = encL.getRps();
-        pwmL = LeftMotor.updatePID(rpsL, pwmL) + 0.513;     // offset at 0.5 duty
-        
-        RightMotor.setReference(5.5);
-        RightMotor.setDT(loop_time_s);
-        RightMotor.setGain(0.045, 0.4, 0);
-        rpsR = 0 - encR.getRps();
-        pwmR = RightMotor.updatePID(rpsR, pwmR) + 0.5;     // offset at 0.5 duty
-        
-        if (ble.sendAvailable()){
-            ble.sendSpeed(pwmL, pwmR);
-        }
-
-        pwmL = clamp(pwmL, 1, 0);
-        motorLeft.speed(pwmL);
-
-        pwmR = clamp(pwmR, 1, 0);
-        motorRight.speed(pwmR);
-
-
-        wait(loop_time_s);
-    }
-};
